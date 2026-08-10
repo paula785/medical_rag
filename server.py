@@ -2,8 +2,8 @@
 MedRAG FastAPI Backend Microservice (Cloud-Powered)
 ---------------------------------------------------
 Decoupled REST API backend using Cloud APIs:
-- Google Gemini 1.5 Flash for ultra-fast Vision OCR
-- Google Gemini text-embedding-004 for high-precision embeddings
+- Google Gemini 2.5 Flash for ultra-fast Vision OCR
+- Google Gemini Embedding (gemini-embedding-001) for high-precision embeddings
 - Groq Llama-3.3-70B for expert clinical RAG reasoning
 - FAISS vector store for fast local indexing
 """

@@ -115,7 +115,7 @@ with st.sidebar:
     
     st.subheader("🔑 Gemini API Configuration")
     gemini_api_key = os.getenv("GEMINI_API_KEY", "")
-    input_gemini = st.text_input("Gemini API Key", value=gemini_api_key, type="password", help="Used for Cloud OCR (Gemini 1.5 Flash) & Embeddings (text-embedding-004)")
+    input_gemini = st.text_input("Gemini API Key", value=gemini_api_key, type="password", help="Used for Cloud OCR (Gemini 2.5 Flash) & Embeddings (gemini-embedding-001)")
     if input_gemini:
         os.environ["GEMINI_API_KEY"] = input_gemini
         gemini_api_key = input_gemini
@@ -177,7 +177,7 @@ with st.sidebar:
 st.markdown("""
 <div class="main-header">
     <h1>🩺 MedRAG: Cloud-Powered Multimodal Assistant</h1>
-    <p>High-Speed Cloud Processing: Gemini 1.5 Flash (OCR) + Gemini Embeddings + Groq Llama-3.3-70B Clinical Reasoning</p>
+    <p>High-Speed Cloud Processing: Gemini 2.5 Flash (OCR) + Gemini Embeddings + Groq Llama-3.3-70B Clinical Reasoning</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -189,7 +189,7 @@ tab1, tab2 = st.tabs(["📄 Document Ingestion (Cloud OCR & PDF)", "💬 Medical
 # ---------------------------------------------------------
 with tab1:
     st.subheader("Upload Clinical Document (Image or PDF)")
-    st.caption("Extract clinical details using Gemini 1.5 Flash (for images) or PyPDF (for PDFs) and index into FAISS.")
+    st.caption("Extract clinical details using Gemini 2.5 Flash (for images) or PyPDF (for PDFs) and index into FAISS.")
     
     col1, col2 = st.columns([1, 1])
     
@@ -222,7 +222,7 @@ with tab1:
             if not gemini_api_key:
                 st.error("⚠️ Missing Gemini API Key! Please enter your key in the sidebar.")
             else:
-                with st.spinner("Processing document via Gemini 1.5 Flash & Google Embeddings..."):
+                with st.spinner("Processing document via Gemini 2.5 Flash & Google Embeddings..."):
                     try:
                         files = {"file": (uploaded_file.name, file_bytes, uploaded_file.type)}
                         data = {"doc_type": doc_category, "gemini_api_key": gemini_api_key}
