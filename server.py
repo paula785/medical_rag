@@ -3,24 +3,29 @@ MedRAG FastAPI Backend Microservice (Cloud-Powered)
 ---------------------------------------------------
 Decoupled REST API backend using Cloud APIs:
 - Google Gemini 2.5 Flash for ultra-fast Vision OCR
-- Google Gemini Embedding (gemini-embedding-001) for high-precision embeddings
+- Google Gemini Embedding (gemini-embedding-001, 3072-dim) for embeddings
 - Groq Llama-3.3-70B for expert clinical RAG reasoning
-- FAISS vector store for fast local indexing
+- FAISS vector store with in-memory singleton cache
 """
 
 import os
 import base64
+import hashlib
+import logging
 from io import BytesIO
 from datetime import datetime
+from typing import AsyncGenerator
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_groq import ChatGroq
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import FAISS
@@ -28,23 +33,55 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# App & Middleware
-app = FastAPI(title="MedRAG Cloud Backend Microservice", version="3.0.0")
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("medrag")
+
+# ─── App & Middleware ──────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Modern lifespan handler: runs startup logic, then yields for shutdown."""
+    logger.info("MedRAG v4.0 starting — Gemini OCR: %s | Embed: %s | Groq: %s",
+                GEMINI_OCR_MODEL, GEMINI_EMBED_MODEL, GROQ_MODEL_DEFAULT)
+    if GEMINI_API_KEY:
+        try:
+            get_faiss_store()
+        except Exception as e:
+            logger.warning("FAISS warm-up skipped: %s", e)
+    else:
+        logger.warning("GEMINI_API_KEY not set — FAISS will initialize on first request.")
+    yield  # app runs here
+    logger.info("MedRAG shutting down.")
+
+app = FastAPI(title="MedRAG Cloud Backend Microservice", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8501",
+        "http://127.0.0.1:8501",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ─── Constants ─────────────────────────────────────────────────────────────────
 FAISS_DB_DIR = "./med_rag_faiss"
 GROQ_MODEL_DEFAULT = "llama-3.3-70b-versatile"
+GEMINI_EMBED_MODEL = "models/gemini-embedding-001"
+GEMINI_OCR_MODEL = "gemini-2.5-flash"
+MAX_FILE_SIZE = 10 * 1024 * 1024   # 10 MB
+MAX_QUESTION_LEN = 2000             # characters
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
-# Baseline Patient Data (Unchangeable system background records)
+# ─── Baseline Patient Records (immutable system defaults) ─────────────────────
 BASELINE_PATIENT_RECORDS = [
     Document(
         page_content="""PATIENT DEMOGRAPHICS & CLINICAL HISTORY:
@@ -82,142 +119,52 @@ Lipid Panel: Total Cholesterol 210 mg/dL, Triglycerides 180 mg/dL, HDL 42 mg/dL,
     )
 ]
 
-def get_embeddings(gemini_key: str = None):
-    key = gemini_key or os.getenv("GEMINI_API_KEY", "")
-    if not key:
-        raise HTTPException(status_code=400, detail="Missing Gemini API Key for Embeddings.")
-    return GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=key)
+# ─── FAISS In-Memory Singleton Cache ──────────────────────────────────────────
+_faiss_store = None
 
-def load_or_init_faiss(gemini_key: str = None):
-    embeddings = get_embeddings(gemini_key)
+def get_embeddings(key: str = None) -> GoogleGenerativeAIEmbeddings:
+    api_key = key or GEMINI_API_KEY
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Missing Gemini API Key. Set GEMINI_API_KEY in your .env file.")
+    return GoogleGenerativeAIEmbeddings(model=GEMINI_EMBED_MODEL, google_api_key=api_key)
+
+def get_faiss_store(force_reload: bool = False) -> FAISS:
+    """Return the in-memory FAISS store, loading or initializing it only once."""
+    global _faiss_store
+    if _faiss_store is not None and not force_reload:
+        return _faiss_store
+
+    embeddings = get_embeddings()
     index_path = os.path.join(FAISS_DB_DIR, "index.faiss")
+
     if os.path.exists(FAISS_DB_DIR) and os.path.exists(index_path):
         try:
-            return FAISS.load_local(FAISS_DB_DIR, embeddings, allow_dangerous_deserialization=True)
-        except Exception:
-            pass
-    store = FAISS.from_documents(BASELINE_PATIENT_RECORDS, embeddings)
-    store.save_local(FAISS_DB_DIR)
-    return store
+            logger.info("Loading FAISS index from disk: %s", FAISS_DB_DIR)
+            _faiss_store = FAISS.load_local(FAISS_DB_DIR, embeddings, allow_dangerous_deserialization=True)
+            logger.info("FAISS loaded — %d vectors in store.", _faiss_store.index.ntotal)
+            return _faiss_store
+        except Exception as e:
+            logger.warning("FAISS load failed (%s). Reinitializing from baseline records.", e)
 
-# Request Models
+    logger.info("Initializing fresh FAISS index from %d baseline records.", len(BASELINE_PATIENT_RECORDS))
+    _faiss_store = FAISS.from_documents(BASELINE_PATIENT_RECORDS, embeddings)
+    _faiss_store.save_local(FAISS_DB_DIR)
+    logger.info("FAISS initialized and saved to disk.")
+    return _faiss_store
+
+
+
+# ─── Request / Response Models ─────────────────────────────────────────────────
+class ChatMessage(BaseModel):
+    role: str   # "user" or "assistant"
+    content: str
+
 class ChatRequest(BaseModel):
-    question: str
-    groq_api_key: str
-    gemini_api_key: str = ""
+    question: str = Field(..., max_length=MAX_QUESTION_LEN)
+    chat_history: list[ChatMessage] = Field(default=[], max_length=10)
 
-# Endpoints
-@app.get("/health")
-async def health_check(gemini_key: str = ""):
-    key = gemini_key or os.getenv("GEMINI_API_KEY", "")
-    gemini_configured = bool(key)
-    groq_configured = bool(os.getenv("GROQ_API_KEY", ""))
-    
-    faiss_count = 0
-    if gemini_configured:
-        try:
-            vs = load_or_init_faiss(key)
-            for _, doc in vs.docstore._dict.items():
-                if not doc.metadata.get("is_baseline", False):
-                    faiss_count += 1
-        except Exception:
-            pass
-
-    return {
-        "status": "online",
-        "gemini_active": gemini_configured,
-        "groq_active": groq_configured,
-        "user_documents_count": faiss_count
-    }
-
-@app.post("/ingest")
-async def ingest_document(
-    file: UploadFile = File(...),
-    doc_type: str = Form(...),
-    gemini_api_key: str = Form("")
-):
-    key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-    if not key:
-        raise HTTPException(status_code=400, detail="Gemini API Key is required for Cloud OCR & Embeddings.")
-
-    contents = await file.read()
-    filename = file.filename
-    ext = filename.split(".")[-1].lower() if "." in filename else "bin"
-    
-    extracted_text = ""
-    if ext == "pdf":
-        try:
-            reader = PdfReader(BytesIO(contents))
-            pages = [f"--- PAGE {i+1} ---\n{p.extract_text().strip()}" for i, p in enumerate(reader.pages) if p.extract_text()]
-            extracted_text = "\n\n".join(pages) if pages else "No text extracted from PDF."
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"PDF extraction error: {e}")
-    else:
-        # Perform ultra-fast Cloud Vision OCR using Gemini 2.5 Flash
-        try:
-            img_b64 = base64.b64encode(contents).decode("utf-8")
-            mime_type = file.content_type or f"image/{ext}"
-            
-            prompt = """You are an expert clinical document OCR specialist and medical transcription assistant.
-Examine this medical image carefully. Extract all visible text, doctor details, dates, medications, dosages, lab parameters, and clinical values accurately.
-Summarize key findings in structured headings: DOCUMENT TYPE & DATE, PATIENT & PROVIDER INFO, LAB PARAMETERS & TEST RESULTS, MEDICATION PRESCRIPTIONS, CLINICAL NOTES."""
-
-            llm = ChatGoogleGenerativeAI(
-                model="gemini-2.5-flash",
-                google_api_key=key,
-                temperature=0.1
-            )
-            message = HumanMessage(
-                content=[
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": f"data:{mime_type};base64,{img_b64}"
-                    }
-                ]
-            )
-            res = llm.invoke([message])
-            extracted_text = res.content
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Gemini Cloud OCR error: {e}")
-
-    # Embed & index into FAISS using Gemini Embeddings
-    try:
-        doc = Document(
-            page_content=extracted_text,
-            metadata={
-                "source": filename,
-                "doc_type": doc_type,
-                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "is_baseline": False,
-                "file_type": ext
-            }
-        )
-        vs = load_or_init_faiss(key)
-        vs.add_documents([doc])
-        vs.save_local(FAISS_DB_DIR)
-    except Exception as err:
-        raise HTTPException(status_code=500, detail=f"FAISS embedding error: {err}")
-
-    return {"status": "success", "filename": filename, "extracted_text": extracted_text}
-
-@app.post("/chat")
-async def chat_medical_rag(req: ChatRequest):
-    groq_key = req.groq_api_key or os.getenv("GROQ_API_KEY", "")
-    gemini_key = req.gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-    
-    if not groq_key:
-        raise HTTPException(status_code=400, detail="Missing Groq API Key.")
-    if not gemini_key:
-        raise HTTPException(status_code=400, detail="Missing Gemini API Key.")
-
-    vs = load_or_init_faiss(gemini_key)
-    retriever = vs.as_retriever(search_kwargs={"k": 4})
-    retrieved_docs = retriever.invoke(req.question)
-    
-    context_str = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
-    
-    system_prompt = """You are an elite, board-certified Clinical AI Specialist and Pharmacotherapy Consultant.
+# ─── Helper: Build Clinical Prompt ────────────────────────────────────────────
+SYSTEM_PROMPT = """You are an elite, board-certified Clinical AI Specialist and Pharmacotherapy Consultant.
 Your objective is to provide high-precision, clinically accurate, and safe answers to medical inquiries using the patient's retrieved medical records.
 
 RETRIEVED PATIENT CONTEXT:
@@ -233,16 +180,161 @@ CLINICAL GUIDELINES FOR YOUR RESPONSE:
    - **Important Medical Disclaimer**
 4. Maintain an empathetic, professional, and rigorous clinical tone."""
 
+def build_llm_chain(context: str):
+    groq_key = GROQ_API_KEY
+    if not groq_key:
+        raise HTTPException(status_code=400, detail="Missing Groq API Key. Set GROQ_API_KEY in your .env file.")
+
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
-        ("human", "{question}")
+        ("system", SYSTEM_PROMPT),
+        MessagesPlaceholder(variable_name="history"),
+        ("human", "{question}"),
     ])
-    
+    llm = ChatGroq(model_name=GROQ_MODEL_DEFAULT, groq_api_key=groq_key, temperature=0.2)
+    return prompt | llm, context
+
+def convert_history(chat_history: list[ChatMessage]) -> list:
+    """Convert pydantic ChatMessage list to LangChain message objects."""
+    messages = []
+    for msg in chat_history:
+        if msg.role == "user":
+            messages.append(HumanMessage(content=msg.content))
+        elif msg.role == "assistant":
+            messages.append(AIMessage(content=msg.content))
+    return messages
+
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+async def health_check():
+    gemini_configured = bool(GEMINI_API_KEY)
+    groq_configured = bool(GROQ_API_KEY)
+
+    faiss_count = 0
+    if gemini_configured:
+        try:
+            vs = get_faiss_store()
+            for _, doc in vs.docstore._dict.items():
+                if not doc.metadata.get("is_baseline", False):
+                    faiss_count += 1
+        except Exception as e:
+            logger.error("Health check FAISS error: %s", e)
+
+    return {
+        "status": "online",
+        "gemini_active": gemini_configured,
+        "groq_active": groq_configured,
+        "user_documents_count": faiss_count,
+        "models": {
+            "ocr": GEMINI_OCR_MODEL,
+            "embed": GEMINI_EMBED_MODEL,
+            "chat": GROQ_MODEL_DEFAULT,
+        }
+    }
+
+
+@app.post("/ingest")
+async def ingest_document(
+    file: UploadFile = File(...),
+    doc_type: str = Form(...),
+):
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=400, detail="Gemini API Key not configured. Set GEMINI_API_KEY in .env.")
+
+    contents = await file.read()
+    filename = file.filename
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+
+    # ── Validation: file size ──
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail=f"File exceeds 10 MB limit ({len(contents) // 1024 // 1024} MB uploaded).")
+
+    logger.info("Ingesting '%s' (%d KB, type=%s)", filename, len(contents) // 1024, doc_type)
+
+    # ── Deduplication via SHA-256 ──
+    content_hash = hashlib.sha256(contents).hexdigest()
+    vs = get_faiss_store()
+    for _, doc in vs.docstore._dict.items():
+        if doc.metadata.get("content_hash") == content_hash:
+            logger.info("Duplicate detected for '%s' — skipping ingestion.", filename)
+            return {"status": "duplicate", "filename": filename, "message": "This document has already been indexed.", "extracted_text": doc.page_content}
+
+    # ── Extraction ──
+    extracted_text = ""
+    if ext == "pdf":
+        try:
+            reader = PdfReader(BytesIO(contents))
+            pages = [f"--- PAGE {i+1} ---\n{p.extract_text().strip()}" for i, p in enumerate(reader.pages) if p.extract_text()]
+            extracted_text = "\n\n".join(pages) if pages else "No text extracted from PDF."
+            logger.info("PDF extracted: %d pages, %d chars.", len(reader.pages), len(extracted_text))
+        except Exception as e:
+            logger.error("PDF extraction failed for '%s': %s", filename, e)
+            raise HTTPException(status_code=400, detail=f"PDF extraction error: {e}")
+    else:
+        try:
+            img_b64 = base64.b64encode(contents).decode("utf-8")
+            mime_type = file.content_type or f"image/{ext}"
+            ocr_prompt = """You are an expert clinical document OCR specialist and medical transcription assistant.
+Examine this medical image carefully. Extract all visible text, doctor details, dates, medications, dosages, lab parameters, and clinical values accurately.
+Summarize key findings in structured headings: DOCUMENT TYPE & DATE, PATIENT & PROVIDER INFO, LAB PARAMETERS & TEST RESULTS, MEDICATION PRESCRIPTIONS, CLINICAL NOTES."""
+
+            llm = ChatGoogleGenerativeAI(model=GEMINI_OCR_MODEL, google_api_key=GEMINI_API_KEY, temperature=0.1)
+            message = HumanMessage(content=[
+                {"type": "text", "text": ocr_prompt},
+                {"type": "image_url", "image_url": f"data:{mime_type};base64,{img_b64}"}
+            ])
+            res = llm.invoke([message])
+            extracted_text = res.content
+            logger.info("Gemini OCR complete for '%s': %d chars extracted.", filename, len(extracted_text))
+        except Exception as e:
+            logger.error("Gemini OCR failed for '%s': %s", filename, e)
+            raise HTTPException(status_code=500, detail=f"Gemini Cloud OCR error: {e}")
+
+    # ── Embed & Index into FAISS ──
     try:
-        llm = ChatGroq(model_name=GROQ_MODEL_DEFAULT, groq_api_key=groq_key, temperature=0.2)
-        chain = prompt | llm
-        response = chain.invoke({"context": context_str, "question": req.question})
-        
+        doc = Document(
+            page_content=extracted_text,
+            metadata={
+                "source": filename,
+                "doc_type": doc_type,
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "is_baseline": False,
+                "file_type": ext,
+                "content_hash": content_hash,
+            }
+        )
+        vs.add_documents([doc])
+        vs.save_local(FAISS_DB_DIR)
+        logger.info("Document '%s' indexed into FAISS. Total vectors: %d", filename, vs.index.ntotal)
+    except Exception as err:
+        logger.error("FAISS embedding error for '%s': %s", filename, err)
+        raise HTTPException(status_code=500, detail=f"FAISS embedding error: {err}")
+
+    return {"status": "success", "filename": filename, "extracted_text": extracted_text}
+
+
+@app.post("/chat")
+async def chat_medical_rag(req: ChatRequest):
+    if len(req.question) > MAX_QUESTION_LEN:
+        raise HTTPException(status_code=400, detail=f"Question exceeds {MAX_QUESTION_LEN} character limit.")
+
+    logger.info("Chat query: '%s...' | history_len=%d", req.question[:60], len(req.chat_history))
+
+    vs = get_faiss_store()
+    retriever = vs.as_retriever(search_kwargs={"k": 4})
+    retrieved_docs = retriever.invoke(req.question)
+    context_str = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+
+    history = convert_history(req.chat_history[-6:])  # last 6 messages max
+
+    # Guard: validate Groq key before entering try block
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=400, detail="Missing Groq API Key. Set GROQ_API_KEY in .env.")
+
+    try:
+        chain, _ = build_llm_chain(context_str)
+        response = chain.invoke({"context": context_str, "question": req.question, "history": history})
+
         user_sources = [
             {
                 "source": d.metadata.get("source", "Unknown"),
@@ -252,15 +344,83 @@ CLINICAL GUIDELINES FOR YOUR RESPONSE:
             }
             for d in retrieved_docs if not d.metadata.get("is_baseline", False)
         ]
-        
+
+        logger.info("Chat response generated: %d chars | %d user sources.", len(response.content), len(user_sources))
         return {"answer": response.content, "user_sources": user_sources}
     except Exception as e:
+        logger.error("Groq chat error: %s", e)
         raise HTTPException(status_code=500, detail=f"Groq API Error: {str(e)}")
 
-@app.delete("/user-documents")
-async def clear_user_documents(gemini_key: str = ""):
-    key = gemini_key or os.getenv("GEMINI_API_KEY", "")
-    embeddings = get_embeddings(key)
-    vs = FAISS.from_documents(BASELINE_PATIENT_RECORDS, embeddings)
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Streaming chat using Server-Sent Events (SSE). Yields tokens as they arrive."""
+    if len(req.question) > MAX_QUESTION_LEN:
+        raise HTTPException(status_code=400, detail=f"Question exceeds {MAX_QUESTION_LEN} character limit.")
+
+    vs = get_faiss_store()
+    retrieved_docs = vs.as_retriever(search_kwargs={"k": 4}).invoke(req.question)
+    context_str = "\n\n---\n\n".join([doc.page_content for doc in retrieved_docs])
+    history = convert_history(req.chat_history[-6:])
+
+    async def token_generator() -> AsyncGenerator[str, None]:
+        try:
+            chain, _ = build_llm_chain(context_str)
+            async for chunk in chain.astream({"context": context_str, "question": req.question, "history": history}):
+                if chunk.content:
+                    yield f"data: {chunk.content}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error("Stream error: %s", e)
+            yield f"data: [ERROR] {str(e)}\n\n"
+
+    return StreamingResponse(token_generator(), media_type="text/event-stream")
+
+
+@app.get("/documents")
+async def list_documents():
+    """List all user-uploaded documents (excludes baseline records)."""
+    vs = get_faiss_store()
+    docs = []
+    for doc_id, doc in vs.docstore._dict.items():
+        if not doc.metadata.get("is_baseline", False):
+            docs.append({
+                "id": doc_id,
+                "source": doc.metadata.get("source", "Unknown"),
+                "doc_type": doc.metadata.get("doc_type", "Record"),
+                "date": doc.metadata.get("date", "N/A"),
+                "file_type": doc.metadata.get("file_type", "unknown"),
+                "snippet": doc.page_content[:200],
+            })
+    logger.info("Document list requested — %d user docs returned.", len(docs))
+    return {"documents": docs, "count": len(docs)}
+
+
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Delete a single user-uploaded document by its FAISS store ID."""
+    vs = get_faiss_store()
+
+    if doc_id not in vs.docstore._dict:
+        raise HTTPException(status_code=404, detail=f"Document ID '{doc_id}' not found.")
+
+    doc = vs.docstore._dict[doc_id]
+    if doc.metadata.get("is_baseline", False):
+        raise HTTPException(status_code=403, detail="Baseline records cannot be deleted.")
+
+    source_name = doc.metadata.get("source", doc_id)
+    vs.delete([doc_id])
     vs.save_local(FAISS_DB_DIR)
+    logger.info("Document '%s' (id=%s) deleted from FAISS.", source_name, doc_id)
+    return {"status": "deleted", "id": doc_id, "source": source_name}
+
+
+@app.delete("/user-documents")
+async def clear_all_user_documents():
+    """Clear ALL user-uploaded documents. Baseline records are preserved."""
+    global _faiss_store
+    embeddings = get_embeddings()
+    _faiss_store = FAISS.from_documents(BASELINE_PATIENT_RECORDS, embeddings)
+    _faiss_store.save_local(FAISS_DB_DIR)
+    logger.info("All user documents cleared. Baseline records retained.")
     return {"status": "success", "message": "User documents cleared. Baseline records retained."}
